@@ -1,0 +1,938 @@
+#!/usr/bin/env python3
+"""
+BrainChat ADV v3 (Offline) — Tkinter + Ollama
+
+Goals: faster, fewer errors, cleaner concurrency.
+
+Key changes:
+- One persistent requests.Session() (connection pooling)
+- Clean cancel/stop (stop_event + response close)
+- Thread-safe UI posting via queue + single pump
+- Model refresh without queue races
+- Stream chunk batching (FAST MODE) to reduce UI overhead
+- Time-to-first-token + tokens/sec estimates
+- Buffered session writes (less disk I/O)
+
+Deps: python3, requests
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import queue
+import re
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+
+DEFAULT_OLLAMA_URL = "http://localhost:11434"
+DEFAULT_MODEL = "llama3:8b"
+DEFAULT_TIMEOUT = 180
+
+APP_NAME = "BrainChat ADV v3 (Offline)"
+SAVE_DIR = Path.home() / ".brainchat"
+SAVE_DIR.mkdir(parents=True, exist_ok=True)
+SESSIONS_INDEX = SAVE_DIR / "sessions.json"
+
+
+# -------------------------- utils --------------------------
+
+@dataclass
+class ChatMessage:
+    role: str
+    content: str
+    ts: float
+
+
+def now_ts() -> float:
+    return time.time()
+
+
+def ts_to_str(ts: float) -> str:
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def safe_json_load(path: Path, default):
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return default
+
+
+def safe_json_save(path: Path, obj: Any):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def is_localhost_url(url: str) -> bool:
+    u = url.strip().lower()
+    return (
+        "://localhost" in u
+        or "://127.0.0.1" in u
+        or "://[::1]" in u
+        or u.startswith("localhost")
+        or u.startswith("127.0.0.1")
+    )
+
+
+def approx_tokens(text: str) -> int:
+    text = text or ""
+    return max(1, len(text) // 4)
+
+
+def transient_error(e: Exception) -> bool:
+    s = str(e).lower()
+    return any(k in s for k in ["timed out", "timeout", "temporarily", "connection", "reset", "broken pipe", "503", "502", "504"])
+
+
+# -------------------------- Ollama client --------------------------
+
+class OllamaClient:
+    """
+    Persistent session + per-request streaming response control.
+    """
+    def __init__(self, base_url: str):
+        self.base_url = base_url.rstrip("/")
+        self.session = requests.Session()
+        self._lock = threading.Lock()
+        self._active_resp: Optional[requests.Response] = None
+
+    def set_base_url(self, base_url: str):
+        self.base_url = base_url.rstrip("/")
+
+    def close_active_stream(self):
+        with self._lock:
+            resp = self._active_resp
+            self._active_resp = None
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+    def list_models(self, timeout: int = 8) -> List[str]:
+        try:
+            r = self.session.get(f"{self.base_url}/api/tags", timeout=timeout)
+            r.raise_for_status()
+            data = r.json()
+            models = [m.get("name") for m in data.get("models", []) if m.get("name")]
+            return sorted(models) if models else []
+        except Exception:
+            return []
+
+    def chat_stream(
+        self,
+        model: str,
+        messages: List[Dict[str, str]],
+        system: Optional[str],
+        options: Dict[str, Any],
+        stop_event: threading.Event,
+        timeout: int = DEFAULT_TIMEOUT,
+        max_retries: int = 2,
+    ):
+        payload: Dict[str, Any] = {"model": model, "messages": messages, "stream": True}
+        if system:
+            payload["system"] = system
+        if options:
+            payload["options"] = options
+
+        attempt = 0
+        backoff = 0.5
+
+        while True:
+            if stop_event.is_set():
+                return
+            try:
+                resp = self.session.post(
+                    f"{self.base_url}/api/chat",
+                    json=payload,
+                    stream=True,
+                    timeout=timeout,
+                )
+                with self._lock:
+                    self._active_resp = resp
+
+                resp.raise_for_status()
+
+                # Ollama streams JSON lines. Some lines may be blank.
+                for raw in resp.iter_lines(decode_unicode=True):
+                    if stop_event.is_set():
+                        return
+                    if not raw:
+                        continue
+                    try:
+                        obj = json.loads(raw)
+                    except Exception:
+                        # ignore garbage lines
+                        continue
+
+                    # Typical: {"message":{"role":"assistant","content":"..."}, "done":false}
+                    msg = obj.get("message")
+                    if isinstance(msg, dict):
+                        chunk = msg.get("content")
+                        if isinstance(chunk, str) and chunk:
+                            yield chunk
+
+                    if obj.get("done") is True:
+                        return
+
+            except Exception as e:
+                attempt += 1
+                if attempt > max_retries or not transient_error(e):
+                    raise
+                time.sleep(backoff)
+                backoff *= 2
+            finally:
+                self.close_active_stream()
+
+    def chat_once(
+        self,
+        model: str,
+        messages: List[Dict[str, str]],
+        system: Optional[str],
+        options: Dict[str, Any],
+        timeout: int = DEFAULT_TIMEOUT,
+        max_retries: int = 2,
+    ) -> str:
+        payload: Dict[str, Any] = {"model": model, "messages": messages, "stream": False}
+        if system:
+            payload["system"] = system
+        if options:
+            payload["options"] = options
+
+        attempt = 0
+        backoff = 0.5
+
+        while True:
+            try:
+                r = self.session.post(f"{self.base_url}/api/chat", json=payload, timeout=timeout)
+                r.raise_for_status()
+                return r.json()["message"]["content"]
+            except Exception as e:
+                attempt += 1
+                if attempt > max_retries or not transient_error(e):
+                    raise
+                time.sleep(backoff)
+                backoff *= 2
+
+
+# -------------------------- App --------------------------
+
+class ChatApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(APP_NAME)
+        self.geometry("1200x780")
+        self.minsize(960, 620)
+
+        # State
+        self.ollama_url = tk.StringVar(value=DEFAULT_OLLAMA_URL)
+        self.model_var = tk.StringVar(value=DEFAULT_MODEL)
+        self.system_default = "You are SABLE. Be witty, technical, and direct. Offline-first. No fluff."
+        self.temp_var = tk.DoubleVar(value=0.7)
+        self.ctx_var = tk.IntVar(value=4096)
+        self.timeout_var = tk.IntVar(value=DEFAULT_TIMEOUT)
+        self.stable_mode = tk.BooleanVar(value=True)
+
+        # performance toggle
+        self.fast_stream_ui = tk.BooleanVar(value=True)  # batching chunks reduces UI overhead
+
+        self.chat_history: List[ChatMessage] = []
+        self.session_path: Optional[Path] = None
+        self.session_title: str = "Untitled"
+        self._session_id: str = ""
+
+        self._stop_event = threading.Event()
+        self._worker_thread: Optional[threading.Thread] = None
+
+        # one queue, one pump
+        self._ui_queue: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
+
+        self.client = OllamaClient(self.ollama_url.get())
+
+        # buffered session write
+        self._log_buf: List[str] = []
+        self._log_lock = threading.Lock()
+        self._log_flush_every = 1.5  # seconds
+        self._last_flush = time.time()
+
+        self._build_ui()
+        self._bind_keys()
+
+        self.after(40, self._ui_pump)
+
+        self.new_session()
+        self.refresh_models_async()
+
+    # ---------------- UI helpers ----------------
+
+    def ui_post(self, kind: str, payload: Any = None):
+        self._ui_queue.put((kind, payload))
+
+    def _build_ui(self):
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        top = ttk.Frame(self, padding=(8, 6))
+        top.grid(row=0, column=0, sticky="ew")
+        top.columnconfigure(12, weight=1)
+
+        ttk.Label(top, text="Ollama URL:").grid(row=0, column=0, sticky="w")
+        self.url_entry = ttk.Entry(top, textvariable=self.ollama_url, width=30)
+        self.url_entry.grid(row=0, column=1, padx=(6, 10), sticky="w")
+
+        ttk.Button(top, text="Ping/Models", command=self.refresh_models_async).grid(row=0, column=2, padx=(0, 10))
+
+        ttk.Label(top, text="Model:").grid(row=0, column=3, sticky="w")
+        self.model_combo = ttk.Combobox(top, textvariable=self.model_var, width=22, state="readonly")
+        self.model_combo.grid(row=0, column=4, padx=(6, 10), sticky="w")
+
+        ttk.Checkbutton(top, text="Stable Mode", variable=self.stable_mode).grid(row=0, column=5, padx=(0, 10))
+        ttk.Checkbutton(top, text="Fast Stream UI", variable=self.fast_stream_ui).grid(row=0, column=6, padx=(0, 10))
+
+        ttk.Button(top, text="New Session", command=self.new_session).grid(row=0, column=7, padx=(0, 6))
+        ttk.Button(top, text="Load", command=self.load_session).grid(row=0, column=8, padx=(0, 6))
+        ttk.Button(top, text="Export", command=self.export_transcript).grid(row=0, column=9, padx=(0, 6))
+        ttk.Button(top, text="Copy Last Answer", command=self.copy_last_answer).grid(row=0, column=10, padx=(0, 6))
+
+        self.session_label = ttk.Label(top, text="Session: -", anchor="w")
+        self.session_label.grid(row=0, column=12, sticky="ew")
+
+        paned = ttk.PanedWindow(self, orient="horizontal")
+        paned.grid(row=1, column=0, sticky="nsew", padx=8, pady=6)
+
+        left = ttk.Frame(paned)
+        left.rowconfigure(0, weight=1)
+        left.columnconfigure(0, weight=1)
+        paned.add(left, weight=3)
+
+        self.chat_text = tk.Text(left, wrap="word", state="disabled", padx=10, pady=10, undo=False)
+        self.chat_text.grid(row=0, column=0, sticky="nsew")
+        self.chat_text.tag_configure("you", font=("TkDefaultFont", 10, "bold"))
+        self.chat_text.tag_configure("brain", font=("TkDefaultFont", 10, "bold"))
+        self.chat_text.tag_configure("meta", foreground="#666666")
+        self.chat_text.tag_configure("err", foreground="#aa0000")
+        self.chat_text.tag_configure("code", font=("TkFixedFont", 10))
+        self.chat_text.tag_configure("found", underline=1)
+
+        chat_scroll = ttk.Scrollbar(left, command=self.chat_text.yview)
+        chat_scroll.grid(row=0, column=1, sticky="ns")
+        self.chat_text["yscrollcommand"] = chat_scroll.set
+
+        self._install_chat_menu()
+
+        bottom = ttk.Frame(self, padding=(8, 6))
+        bottom.grid(row=2, column=0, sticky="ew")
+        bottom.columnconfigure(0, weight=1)
+
+        self.entry = tk.Text(bottom, height=4, wrap="word", undo=True)
+        self.entry.grid(row=0, column=0, sticky="ew")
+        self.entry.focus_set()
+        self._install_entry_menu()
+
+        btns = ttk.Frame(bottom)
+        btns.grid(row=0, column=1, padx=(8, 0), sticky="ns")
+
+        self.send_btn = ttk.Button(btns, text="Send (Ctrl+Enter)", command=self.send)
+        self.send_btn.grid(row=0, column=0, sticky="ew")
+
+        self.stop_btn = ttk.Button(btns, text="Stop (Esc)", command=self.stop_generation, state="disabled")
+        self.stop_btn.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+
+        ttk.Button(btns, text="Clear Chat (Ctrl+L)", command=self.clear_chat).grid(row=2, column=0, sticky="ew", pady=(6, 0))
+
+        right = ttk.Frame(paned, padding=(8, 8))
+        right.columnconfigure(0, weight=1)
+        paned.add(right, weight=1)
+
+        ttk.Label(right, text="System Prompt").grid(row=0, column=0, sticky="w")
+        self.system_box = tk.Text(right, height=7, wrap="word")
+        self.system_box.grid(row=1, column=0, sticky="ew", pady=(6, 10))
+        self.system_box.insert("1.0", self.system_default)
+
+        controls = ttk.LabelFrame(right, text="Generation")
+        controls.grid(row=2, column=0, sticky="ew")
+        controls.columnconfigure(1, weight=1)
+
+        ttk.Label(controls, text="Temperature").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
+        ttk.Scale(controls, from_=0.0, to=1.5, variable=self.temp_var).grid(row=0, column=1, sticky="ew", padx=8, pady=(8, 4))
+
+        ttk.Label(controls, text="Context (num_ctx)").grid(row=1, column=0, sticky="w", padx=8, pady=4)
+        ttk.Spinbox(controls, from_=512, to=32768, increment=256, textvariable=self.ctx_var, width=10).grid(row=1, column=1, sticky="w", padx=8, pady=4)
+
+        ttk.Label(controls, text="Timeout (s)").grid(row=2, column=0, sticky="w", padx=8, pady=4)
+        ttk.Spinbox(controls, from_=10, to=3600, increment=10, textvariable=self.timeout_var, width=10).grid(row=2, column=1, sticky="w", padx=8, pady=4)
+
+        tools = ttk.LabelFrame(right, text="Tools")
+        tools.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        tools.columnconfigure(1, weight=1)
+
+        ttk.Label(tools, text="Search").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
+        self.search_var = tk.StringVar(value="")
+        self.search_entry = ttk.Entry(tools, textvariable=self.search_var)
+        self.search_entry.grid(row=0, column=1, sticky="ew", padx=8, pady=(8, 4))
+        ttk.Button(tools, text="Find", command=self.find_in_chat).grid(row=0, column=2, sticky="e", padx=(0, 8), pady=(8, 4))
+
+        ttk.Button(tools, text="Context Guard", command=self.context_guard_report).grid(row=1, column=0, columnspan=3, sticky="ew", padx=8, pady=(4, 8))
+
+        self.status = tk.StringVar(value="Ready.")
+        ttk.Label(self, textvariable=self.status, anchor="w", padding=(8, 4)).grid(row=3, column=0, sticky="ew")
+
+    def _install_chat_menu(self):
+        self.chat_menu = tk.Menu(self, tearoff=0)
+        self.chat_menu.add_command(label="Copy Selection", command=self.copy_selection_chat)
+        self.chat_menu.add_command(label="Copy Last Answer", command=self.copy_last_answer)
+        self.chat_menu.add_separator()
+        self.chat_menu.add_command(label="Save Selection to File...", command=self.save_selection_to_file)
+
+        def popup(e):
+            try:
+                self.chat_menu.tk_popup(e.x_root, e.y_root)
+            finally:
+                self.chat_menu.grab_release()
+
+        self.chat_text.bind("<Button-3>", popup)
+
+    def _install_entry_menu(self):
+        self.entry_menu = tk.Menu(self, tearoff=0)
+        self.entry_menu.add_command(label="Cut", command=lambda: self.entry.event_generate("<<Cut>>"))
+        self.entry_menu.add_command(label="Copy", command=lambda: self.entry.event_generate("<<Copy>>"))
+        self.entry_menu.add_command(label="Paste", command=lambda: self.entry.event_generate("<<Paste>>"))
+        self.entry_menu.add_separator()
+        self.entry_menu.add_command(label="Clear", command=lambda: self.entry.delete("1.0", "end"))
+
+        def popup(e):
+            try:
+                self.entry_menu.tk_popup(e.x_root, e.y_root)
+            finally:
+                self.entry_menu.grab_release()
+
+        self.entry.bind("<Button-3>", popup)
+
+    def _bind_keys(self):
+        self.entry.bind("<Control-Return>", lambda e: (self.send(True), "break"))
+        self.entry.bind("<Control-Shift-Return>", lambda e: (self.send(False), "break"))
+        self.bind("<Escape>", lambda e: self.stop_generation())
+        self.bind("<Control-l>", lambda e: self.clear_chat())
+        self.bind("<Control-f>", lambda e: self._focus_search())
+
+    def _focus_search(self):
+        try:
+            self.search_entry.focus_set()
+        except Exception:
+            self.status.set("Search focus failed.")
+
+    # ---------------- Session storage ----------------
+
+    def _session_catalog(self) -> Dict[str, Any]:
+        return safe_json_load(SESSIONS_INDEX, {"sessions": []})
+
+    def _update_session_catalog(self):
+        cat = self._session_catalog()
+        cat["sessions"] = [s for s in cat.get("sessions", []) if s.get("id") != self._session_id]
+        cat["sessions"].insert(0, {
+            "id": self._session_id,
+            "title": self.session_title,
+            "path": str(self.session_path) if self.session_path else "",
+            "updated": datetime.now().isoformat(timespec="seconds"),
+            "model": self.model_var.get(),
+        })
+        cat["sessions"] = cat["sessions"][:200]
+        safe_json_save(SESSIONS_INDEX, cat)
+
+    def _set_session_label(self):
+        name = self.session_path.name if self.session_path else "-"
+        self.session_label.configure(text=f"Session: {self.session_title}  [{name}]")
+
+    def _log_write(self, obj: Dict[str, Any]):
+        if not self.session_path:
+            return
+        line = json.dumps(obj, ensure_ascii=False) + "\n"
+        with self._log_lock:
+            self._log_buf.append(line)
+
+    def _log_flush_if_needed(self, force: bool = False):
+        if not self.session_path:
+            return
+        now = time.time()
+        if not force and (now - self._last_flush) < self._log_flush_every:
+            return
+        with self._log_lock:
+            if not self._log_buf:
+                return
+            buf = "".join(self._log_buf)
+            self._log_buf.clear()
+        try:
+            with self.session_path.open("a", encoding="utf-8") as f:
+                f.write(buf)
+            self._last_flush = now
+        except Exception:
+            pass
+
+    def new_session(self):
+        self.stop_generation()
+        self.chat_history.clear()
+        self._reset_chat_view()
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._session_id = stamp
+        self.session_title = "Untitled"
+        self.session_path = SAVE_DIR / f"session_{stamp}.jsonl"
+        self._set_session_label()
+
+        self._log_write({
+            "type": "session_start",
+            "ts": now_ts(),
+            "id": self._session_id,
+            "title": self.session_title,
+            "ollama_url": self.ollama_url.get(),
+            "model": self.model_var.get(),
+        })
+        self._log_flush_if_needed(force=True)
+        self._update_session_catalog()
+        self.status.set(f"New session: {self.session_path.name}")
+
+    def _auto_title_if_needed(self, first_user_prompt: str):
+        if self.session_title != "Untitled":
+            return
+        words = re.findall(r"\w+|\S", first_user_prompt.strip())
+        title = " ".join([w for w in words[:8]]).strip()
+        title = title[:60] if title else "Untitled"
+        self.session_title = title
+        self._log_write({"type": "title", "ts": now_ts(), "title": self.session_title})
+        self._log_flush_if_needed(force=True)
+        self._update_session_catalog()
+        self._set_session_label()
+
+    def load_session(self):
+        path = filedialog.askopenfilename(
+            title="Load session (.jsonl)",
+            initialdir=str(SAVE_DIR),
+            filetypes=[("JSONL", "*.jsonl"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            msgs: List[ChatMessage] = []
+            title = "Loaded"
+            sid = ""
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    obj = json.loads(line)
+                    if obj.get("type") == "session_start":
+                        title = obj.get("title", title)
+                        sid = obj.get("id", sid)
+                    if obj.get("type") == "title":
+                        title = obj.get("title", title)
+                    if obj.get("type") == "msg":
+                        msgs.append(ChatMessage(obj["role"], obj["content"], obj.get("ts", now_ts())))
+
+            self.stop_generation()
+            self.chat_history = msgs
+            self.session_path = Path(path)
+            self._session_id = sid or self.session_path.stem.replace("session_", "")
+            self.session_title = title or "Loaded"
+            self._reset_chat_view()
+            for m in self.chat_history:
+                self._append_to_chat(role=m.role, content=m.content, ts=m.ts, render_only=True)
+            self._set_session_label()
+            self._update_session_catalog()
+            self.status.set(f"Loaded: {self.session_path.name}")
+        except Exception as e:
+            messagebox.showerror("Load failed", str(e))
+
+    def export_transcript(self):
+        default_name = f"transcript_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        path = filedialog.asksaveasfilename(
+            title="Export transcript",
+            defaultextension=".txt",
+            initialfile=default_name,
+            filetypes=[("Text", "*.txt"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f"{APP_NAME}\n")
+                f.write(f"Title: {self.session_title}\n")
+                f.write(f"Exported: {datetime.now().isoformat(timespec='seconds')}\n\n")
+                for m in self.chat_history:
+                    f.write(f"[{ts_to_str(m.ts)}] {m.role.upper()}:\n{m.content}\n\n")
+            self.status.set(f"Exported: {os.path.basename(path)}")
+        except Exception as e:
+            messagebox.showerror("Export failed", str(e))
+
+    # ---------------- Chat rendering ----------------
+
+    def _reset_chat_view(self):
+        self.chat_text.configure(state="normal")
+        self.chat_text.delete("1.0", "end")
+        self.chat_text.configure(state="disabled")
+
+    def _insert_with_code_tags(self, text: str):
+        parts = re.split(r"(```.*?```)", text, flags=re.DOTALL)
+        for p in parts:
+            if p.startswith("```") and p.endswith("```"):
+                inner = p.strip("`")
+                inner = re.sub(r"^\w+\n", "", inner)
+                self.chat_text.insert("end", inner, ("code",))
+            else:
+                self.chat_text.insert("end", p, ())
+
+    def _append_to_chat(self, role: str, content: str, ts: Optional[float] = None, render_only: bool = False):
+        ts = ts if ts is not None else now_ts()
+        who = "You" if role == "user" else ("Brain" if role == "assistant" else role)
+
+        if not render_only:
+            self.chat_history.append(ChatMessage(role=role, content=content, ts=ts))
+            self._log_write({"type": "msg", "ts": ts, "role": role, "content": content})
+            self._update_session_catalog()
+
+        header = f"[{ts_to_str(ts)}]"
+        tag = "you" if who == "You" else ("brain" if who == "Brain" else "meta")
+
+        self.chat_text.configure(state="normal")
+        self.chat_text.insert("end", f"{header} ", ("meta",))
+        self.chat_text.insert("end", f"{who}:\n", (tag,))
+        self._insert_with_code_tags(content)
+        self.chat_text.insert("end", "\n\n")
+        self.chat_text.see("end")
+        self.chat_text.configure(state="disabled")
+
+    def _append_stream_header(self, ts: float):
+        self.chat_text.configure(state="normal")
+        self.chat_text.insert("end", f"[{ts_to_str(ts)}] ", ("meta",))
+        self.chat_text.insert("end", "Brain:\n", ("brain",))
+        self.chat_text.configure(state="disabled")
+
+    def _append_stream_chunk(self, chunk: str):
+        self.chat_text.configure(state="normal")
+        self.chat_text.insert("end", chunk)
+        self.chat_text.see("end")
+        self.chat_text.configure(state="disabled")
+
+    def _append_error(self, msg: str):
+        self.chat_text.configure(state="normal")
+        self.chat_text.insert("end", f"Error: {msg}\n\n", ("err",))
+        self.chat_text.see("end")
+        self.chat_text.configure(state="disabled")
+
+    # ---------------- Actions ----------------
+
+    def clear_chat(self):
+        self.stop_generation()
+        self.chat_history.clear()
+        self._reset_chat_view()
+        self._log_write({"type": "clear", "ts": now_ts()})
+        self._update_session_catalog()
+        self.status.set("Cleared chat.")
+
+    def stop_generation(self):
+        if self._worker_thread and self._worker_thread.is_alive():
+            self._stop_event.set()
+            self.client.close_active_stream()
+            self.status.set("Stopping generation...")
+        self._set_busy(False)
+
+    def _set_busy(self, busy: bool):
+        self.send_btn.configure(state="disabled" if busy else "normal")
+        self.stop_btn.configure(state="normal" if busy else "disabled")
+
+    def find_in_chat(self):
+        needle = self.search_var.get().strip()
+        if not needle:
+            self.status.set("Search: empty.")
+            return
+        self.chat_text.tag_remove("found", "1.0", "end")
+        start = "1.0"
+        hits = 0
+        while True:
+            idx = self.chat_text.search(needle, start, stopindex="end", nocase=True)
+            if not idx:
+                break
+            end = f"{idx}+{len(needle)}c"
+            self.chat_text.tag_add("found", idx, end)
+            start = end
+            hits += 1
+        self.status.set(f"Search hits: {hits}")
+        if hits:
+            self.chat_text.see("found.first")
+
+    def context_guard_report(self):
+        system = self._current_system_prompt()
+        total = approx_tokens(system) + sum(approx_tokens(m.content) for m in self.chat_history)
+        ctx = int(self.ctx_var.get())
+        pct = (total / max(1, ctx)) * 100
+        msg = f"Approx tokens (incl system): {total} / num_ctx {ctx} (~{pct:.0f}%)"
+        if total > ctx * 0.9:
+            msg += "\n\n⚠️ Near context limit. Consider New Session."
+        messagebox.showinfo("Context Guard", msg)
+
+    def copy_selection_chat(self):
+        try:
+            sel = self.chat_text.get("sel.first", "sel.last")
+        except Exception:
+            sel = ""
+        if not sel:
+            self.status.set("No selection.")
+            return
+        self.clipboard_clear()
+        self.clipboard_append(sel)
+        self.status.set("Copied selection.")
+
+    def save_selection_to_file(self):
+        try:
+            sel = self.chat_text.get("sel.first", "sel.last")
+        except Exception:
+            sel = ""
+        if not sel:
+            self.status.set("No selection.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save selection",
+            defaultextension=".txt",
+            initialfile="selection.txt",
+            filetypes=[("Text", "*.txt"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_text(sel, encoding="utf-8")
+            self.status.set(f"Saved selection: {os.path.basename(path)}")
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e))
+
+    def copy_last_answer(self):
+        last = None
+        for m in reversed(self.chat_history):
+            if m.role == "assistant":
+                last = m.content
+                break
+        if not last:
+            self.status.set("No assistant message yet.")
+            return
+        self.clipboard_clear()
+        self.clipboard_append(last)
+        self.status.set("Copied last answer.")
+
+    # ---------------- Send logic ----------------
+
+    def _current_system_prompt(self) -> str:
+        return self.system_box.get("1.0", "end").strip()
+
+    def _build_messages(self, user_prompt: str) -> List[Dict[str, str]]:
+        msgs = [{"role": m.role, "content": m.content} for m in self.chat_history if m.role in ("user", "assistant")]
+        msgs.append({"role": "user", "content": user_prompt})
+        return msgs
+
+    def _validate_env(self) -> Optional[str]:
+        url = self.ollama_url.get().strip()
+        if self.stable_mode.get() and not is_localhost_url(url):
+            return "Stable Mode is ON: Ollama URL must be localhost/127.0.0.1.\nDisable Stable Mode if you mean it."
+        return None
+
+    def send(self, stream: bool = True):
+        prompt = self.entry.get("1.0", "end").strip()
+        if not prompt:
+            return
+
+        env_err = self._validate_env()
+        if env_err:
+            messagebox.showwarning("Blocked", env_err)
+            return
+
+        # update base_url without recreating session
+        self.client.set_base_url(self.ollama_url.get().strip())
+
+        self.entry.delete("1.0", "end")
+        self._append_to_chat("user", prompt)
+        self._auto_title_if_needed(prompt)
+
+        self.status.set("Sending...")
+        self._set_busy(True)
+        self._stop_event.clear()
+
+        model = self.model_var.get().strip() or DEFAULT_MODEL
+        system = self._current_system_prompt()
+        timeout = int(self.timeout_var.get())
+        options = {"temperature": float(self.temp_var.get()), "num_ctx": int(self.ctx_var.get())}
+        messages = self._build_messages(prompt)
+
+        def worker():
+            t0 = time.time()
+            first_token_at = None
+            chars = 0
+
+            try:
+                if stream:
+                    ts = now_ts()
+                    self.ui_post("assistant_start", ts)
+
+                    # UI batching
+                    buf = []
+                    ui_flush_interval = 0.06 if self.fast_stream_ui.get() else 0.0
+                    last_ui = time.time()
+
+                    reply_parts: List[str] = []
+
+                    for chunk in self.client.chat_stream(
+                        model=model,
+                        messages=messages,
+                        system=system,
+                        options=options,
+                        stop_event=self._stop_event,
+                        timeout=timeout,
+                    ):
+                        if first_token_at is None:
+                            first_token_at = time.time()
+                            self.ui_post("status", f"First token: {(first_token_at - t0):.2f}s")
+
+                        reply_parts.append(chunk)
+                        chars += len(chunk)
+
+                        if ui_flush_interval > 0:
+                            buf.append(chunk)
+                            if (time.time() - last_ui) >= ui_flush_interval:
+                                self.ui_post("assistant_chunk", "".join(buf))
+                                buf.clear()
+                                last_ui = time.time()
+                        else:
+                            self.ui_post("assistant_chunk", chunk)
+
+                    if buf:
+                        self.ui_post("assistant_chunk", "".join(buf))
+
+                    if self._stop_event.is_set():
+                        self.ui_post("assistant_done_stopped", None)
+                        return
+
+                    reply = "".join(reply_parts).strip()
+                    self.ui_post("assistant_finalize", (reply, ts))
+
+                else:
+                    reply = self.client.chat_once(
+                        model=model,
+                        messages=messages,
+                        system=system,
+                        options=options,
+                        timeout=timeout,
+                    ).strip()
+                    self.ui_post("assistant_full", reply)
+
+                elapsed = time.time() - t0
+                tps = (approx_tokens("x" * chars) / elapsed) if elapsed > 0 else 0
+                ft = (first_token_at - t0) if first_token_at else elapsed
+                self.ui_post("status", f"Done. {elapsed:.1f}s | first={ft:.2f}s | ~{tps:.1f} tok/s | model={model}")
+
+            except Exception as e:
+                self.ui_post("error", str(e))
+            finally:
+                self.ui_post("busy", False)
+
+        self._worker_thread = threading.Thread(target=worker, daemon=True)
+        self._worker_thread.start()
+
+    # ---------------- UI pump ----------------
+
+    def _ui_pump(self):
+        try:
+            while True:
+                kind, payload = self._ui_queue.get_nowait()
+
+                if kind == "busy":
+                    self._set_busy(bool(payload))
+                    if not payload:
+                        self.status.set("Ready.")
+                        self._log_flush_if_needed(force=True)
+
+                elif kind == "status":
+                    self.status.set(str(payload))
+
+                elif kind == "error":
+                    self._append_error(str(payload))
+                    self.status.set("Error.")
+
+                elif kind == "assistant_start":
+                    ts = payload if isinstance(payload, float) else now_ts()
+                    self._append_stream_header(ts)
+
+                elif kind == "assistant_chunk":
+                    self._append_stream_chunk(str(payload))
+
+                elif kind == "assistant_finalize":
+                    reply, ts = payload
+                    self.chat_text.configure(state="normal")
+                    self.chat_text.insert("end", "\n\n")
+                    self.chat_text.configure(state="disabled")
+                    self.chat_text.see("end")
+
+                    self.chat_history.append(ChatMessage("assistant", reply, ts))
+                    self._log_write({"type": "msg", "ts": ts, "role": "assistant", "content": reply})
+                    self._update_session_catalog()
+                    self._log_flush_if_needed()
+
+                elif kind == "assistant_full":
+                    self._append_to_chat("assistant", str(payload))
+                    self._log_flush_if_needed()
+
+                elif kind == "assistant_done_stopped":
+                    self.chat_text.configure(state="normal")
+                    self.chat_text.insert("end", "\n\n[stopped]\n\n", ("meta",))
+                    self.chat_text.configure(state="disabled")
+                    self.chat_text.see("end")
+                    self.status.set("Stopped.")
+                    self._log_flush_if_needed(force=True)
+
+                elif kind == "models_result":
+                    models: List[str] = payload or []
+                    if models:
+                        self.model_combo["values"] = models
+                        if self.model_var.get() not in models:
+                            self.model_var.set(models[0])
+                        self.status.set(f"Models loaded: {len(models)}")
+                    else:
+                        self.model_combo["values"] = [self.model_var.get()]
+                        self.status.set("Could not fetch /api/tags. Using current model.")
+
+        except queue.Empty:
+            pass
+        finally:
+            self._log_flush_if_needed()
+            self.after(40, self._ui_pump)
+
+    # ---------------- Models ----------------
+
+    def refresh_models_async(self):
+        env_err = self._validate_env()
+        if env_err:
+            messagebox.showwarning("Blocked", env_err)
+            return
+
+        self.status.set("Fetching models...")
+        self.client.set_base_url(self.ollama_url.get().strip())
+
+        def worker():
+            models = self.client.list_models(timeout=6)
+            self.ui_post("models_result", models)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+
+if __name__ == "__main__":
+    app = ChatApp()
+    app.mainloop()
